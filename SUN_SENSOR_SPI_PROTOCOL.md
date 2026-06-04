@@ -181,7 +181,7 @@ The `READ_FRAME` response is **27 bytes**:
 | 14..15 | `A2`           | 2 | i16 BE | Raw ADC quadrant 2 (Top-Right), 32-sample averaged. |
 | 16..17 | `A3`           | 2 | i16 BE | Raw ADC quadrant 3 (Bottom-Right), 32-sample averaged. |
 | 18..21 | `sum`          | 4 | u32 BE | Sum of all four quadrants after dark-offset correction. Drops when the light spot leaves the photodiode array — useful for diagnosing past-FOV conditions. |
-| 22..23 | `temp_c100`    | 2 | i16 BE | On-chip computed temperature in **centi-°C** (0.01 °C/LSB). Convert: `T_celsius = temp_c100 / 100.0`. Range −55.00…+125.00 °C; resolution 0.5 °C (sensor runs in 9-bit mode). Sentinel `0x8000` (−327.68) = AT30TS74 not responding. |
+| 22..23 | `temp_c100`    | 2 | i16 BE | **Board** temperature from the external **AT30TS74** I²C sensor, converted on the sensor MCU to **centi-°C** (0.01 °C/LSB) — *not* the MSP430 internal sensor. Convert: `T_celsius = temp_c100 / 100.0`. Range −55.00…+125.00 °C; resolution 0.5 °C (9-bit mode). Sentinel `0x8000` (−327.68) = AT30TS74 not responding (fail-soft; see §11). |
 | 24     | `flags`        | 1 | u8     | Bit 0 = `NO_SUN` (sensor sees no sun, vector is zeroed). Bit 1 = `OFF_FOV` (sun is near or past the FOV edge, ~±55°; vector still emitted but accuracy degrades). Bit 2 = `SATURATED` (≥1 ADC channel is past 80% of full scale; centroid biased toward unsaturated channels). |
 | 25..26 | `CRC16`        | 2 | u16 BE | CRC-16/CCITT-FALSE over bytes 0..24 (the 25 preceding bytes). See §6. |
 
@@ -620,9 +620,12 @@ variable and naive "byte 1 is the response" reads will fail intermittently.
 - ADC: SD24 sigma-delta, OSR=256, 4 channels in parallel at 4 kHz raw.
 - Frame averaging: 32 raw samples averaged into one published frame
   → **125 Hz** internal frame rate; `sample_count` advances by 32 per frame.
-- Temperature: AT30TS74 via internal I2C, refreshed once per second; the raw
-  register is converted to centi-°C on-chip (`T = raw/256`, 9-bit / 0.5 °C
-  resolution) and only that is shipped (FRAME bytes 22..23).
+- Temperature: external **AT30TS74** on the MCU's I²C (eUSCI_B), refreshed once
+  per second; the raw register is converted to centi-°C on the MCU (`T =
+  raw/256`, 9-bit / 0.5 °C resolution) and only that is shipped (FRAME bytes
+  22..23). The read is **fail-soft**: on an I²C timeout/fault the firmware resets
+  the eUSCI and returns the `0x8000` sentinel (never hangs), but it does not
+  recover a physically stuck SDA/SCL bus — temperature then stays invalid.
 - SPI slave: eUSCI_A0 in **4-pin hardware-framed** mode (UCMODE_2, STE
   active-low on the CS pin), SPI Mode 0, MSB-first. The ISR is **always-RX**
   (every received byte queues the next response byte), which yields the

@@ -63,16 +63,21 @@
 #endif
 
 //! \brief CPU Active Frequency in Hz.
+//!  NOTE: the DCO is calibrated to 16.384 MHz in low_level_init()
+//!  (_system_pre_init), NOT 8 MHz.  These FREQ macros are currently declarative
+//!  only -- nothing in the build derives delays/baud/timeouts from them (the
+//!  UART baud uses hard-coded register values) -- but they are set to the true
+//!  clock so any future timing math based on them is correct, not 2x off.
 //!
-#define CPU_FREQ_HZ                 (8000000)
-//! \brief CPU Active Frequency in MHz.
+#define CPU_FREQ_HZ                 (16384000UL)
+//! \brief CPU Active Frequency in MHz (integer divide truncates 16.384 -> 16).
 //!
 #define CPU_FREQ_MHZ                (CPU_FREQ_HZ/1000000)
 //! \brief High Speed Bus Frequency in Hz.
 //!         Used by High Speed peripherals such as UART.
 //!
-#define HSBUS_FREQ_HZ               (8000000)
-//! \brief High Speed Bus Frequency in MHz.
+#define HSBUS_FREQ_HZ               (16384000UL)
+//! \brief High Speed Bus Frequency in MHz (integer divide truncates 16.384 -> 16).
 //!         Used by High Speed peripherals such as UART.
 //!
 #define HSBUS_FREQ_MHZ              (HSBUS_FREQ_HZ/1000000)

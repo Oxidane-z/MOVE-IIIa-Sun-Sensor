@@ -104,6 +104,7 @@
 volatile uint8_t  command, adcChannel, adcA0Preload, adcA1Preload, adcA0Gain, adcA1Gain, adcReady;
 volatile uint16_t adcA0Data, adcA1Data, adcA2Data, adcA3Data;
 volatile uint32_t sample_count;                 // Incremented every ADC group; doubles as timestamp
+volatile uint16_t sd24_ovf_count;               // SD24 modulator-overflow events (diagnostic only; not framed)
 static   int16_t  ext_temp_c100;                 // Latest AT30TS74 reading in 0.01 degC (0x8000 = sensor invalid)
 
 //*****************************************************************************
@@ -271,6 +272,10 @@ static uint8_t i2c_wait_stop_clear(void)        // 1 = STOP cleared, 0 = timed o
 
 static int16_t i2c_fault(void)                  // recover the peripheral, report invalid
 {
+    // Fail-soft: prevents a firmware hang and reports an invalid reading, but
+    // resetting the eUSCI does NOT recover a *physically* stuck bus (a slave
+    // holding SDA/SCL low) -- temperature then stays invalid until power-cycle.
+    // Acceptable here: temperature is non-critical to the sun vector.
     UCB0CTLW0 |= UCSWRST;                       // reset the eUSCI_B state machine
     UCB0CTLW0 &= ~UCSWRST;                      // (configuration registers are retained)
     return TEMP_C100_INVALID;
@@ -812,7 +817,7 @@ void __attribute__ ((interrupt(SD24_VECTOR))) SD24_ISR (void)
 {
     switch (__even_in_range(SD24IV,SD24IV_SD24MEM3)) {
         case SD24IV_NONE: break;
-        case SD24IV_SD24OVIFG: break;
+        case SD24IV_SD24OVIFG: sd24_ovf_count++; break;   // count only; expose via a v3 INTERNAL_FAULT flag (v2 frame flags must stay <= 0x07 for READ_STATUS resync)
         case SD24IV_SD24MEM0: break;
         case SD24IV_SD24MEM1: break;
         case SD24IV_SD24MEM2: break;
