@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<?ccsproject version="1.0"?>
+<projectOptions>
+	<ccsVariant value="50:Theia-based"/>
+	<ccsVersion value="70.5.0"/>
+	<deviceFamily value="MSP430"/>
+	<executableActions value=""/>
+	<createSlaveProjects value=""/>
+	<templateProperties value="id=msp430i20xx_sigma-delta_adc_demo_mpack.projectspec.CCS Project using GUI Composer"/>
+	<connection value="common/targetdb/connections/TIMSP430-USB.xml"/>
+	<activeTargetConfiguration value="targetConfigs/MSP430i2041.ccxml"/>
+	<origin value="C:\ti\msp430ware_3_80_14_01\examples\demos\Sensing_MCUs\flexAFE_SDADC_i20xx\msp430i20xx_sigma-delta_adc_demo_mpack_CCS\msp430i20xx_sigma-delta_adc_demo_mpack.projectspec"/>
+	<filesToOpen value=""/>
+</projectOptions>
