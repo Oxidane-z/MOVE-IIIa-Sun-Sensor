@@ -9,7 +9,7 @@ SPI slave**.
 ## Repository layout
 
 ```
-CCS Project using GUI Composer/   MSP430i2041 firmware (Code Composer Studio project)
+MOVE-IIIa-SunSensor/   MSP430i2041 firmware (Code Composer Studio project)
   Source/                         application, GUI/SPI transport, MSP430 HAL
   Include/                        public headers (HAL.h is the stable contract)
   targetConfigs/                  CCS target (.ccxml)
@@ -33,7 +33,7 @@ expected at `C:/ti/ccs2050/ccs/tools/compiler/ti-cgt-msp430_21.6.1.LTS`
 (`CG_TOOL_ROOT` in the makefiles).
 
 ```sh
-gmake -C "CCS Project using GUI Composer/Debug" all      # or Release/
+gmake -C "MOVE-IIIa-SunSensor/Debug" all      # or Release/
 ```
 
 Two mutually-exclusive output modes (compile-time, in `Include/Config_Common.h`):

@@ -1,6 +1,6 @@
 # ---- CCS / build outputs (generated, do not commit) ----
-CCS Project using GUI Composer/Debug/
-CCS Project using GUI Composer/Release/
+MOVE-IIIa-SunSensor/Debug/
+MOVE-IIIa-SunSensor/Release/
 *.out
 *.map
 *.obj
