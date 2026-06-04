@@ -1,0 +1,11 @@
+# Normalize line endings: store LF in the repo, check out native on each OS.
+* text=auto
+
+# Binary file types — never normalize or text-diff these.
+*.png  binary
+*.pdf  binary
+*.zip  binary
+*.stl  binary
+*.ipt  binary
+*.out  binary
+*.map  binary

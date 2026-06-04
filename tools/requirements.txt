@@ -1,0 +1,5 @@
+# Dependencies for the host-side Python tools in tools/
+#   pip install -r tools/requirements.txt
+numpy        # fit_calibration.py ; sun_sensor_viz.py
+matplotlib   # sun_sensor_viz.py (3D) ; fit_calibration.py --plots
+pyserial     # serial_log.py ; serial_rate.py ; sun_sensor_viz.py --port
