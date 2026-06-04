@@ -4,9 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A TI **MSP430i2041** embedded firmware project (Sigma-Delta ADC demo) built in **Code Composer Studio Theia** (CCS v70.5.0). The firmware streams two SD24 ADC channels to a host PC running a GUI Composer GUI over UART, and accepts commands back from the GUI to change PGA gain and channel preload.
+Firmware for a **4-quadrant pinhole sun sensor** on a TI **MSP430i2041**, built in **Code Composer Studio Theia** (CCS v70.5.0). The SD24 sigma-delta ADC reads four photodiode quadrants (TIAs on A0..A3); the firmware block-averages them, computes the **sun unit-vector on-chip** (trig-free closed form), reads an external **AT30TS74** I²C temperature sensor, and serves the result to a host.
 
-Source originates from TI's `msp430i20xx_sigma-delta_adc_demo_mpack` projectspec under `msp430ware_3_80_14_01`.
+Two mutually-exclusive output paths (compile-time, in [Include/Config_Common.h](MOVE-IIIa-SunSensor/Include/Config_Common.h)):
+
+- **`USE_SPI_OUTPUT` (default, production):** 4-wire hardware-framed **SPI slave** on eUSCI_A0. The host polls 27-byte frames (sun vector, raw quadrant ADCs, dark-corrected sum, temperature in centi-°C, flags, CRC-16). The wire protocol is fully specified in [SUN_SENSOR_SPI_PROTOCOL.md](SUN_SENSOR_SPI_PROTOCOL.md) (v2).
+- **`USE_UART_OUTPUT` (legacy/dev):** streams the same values over UART (plain text for the [tools/](tools/) Python scripts; the original TI GUI-Composer/mpack command path is also still present here).
+
+The firmware base originated from TI's `msp430i20xx_sigma-delta_adc_demo_mpack` projectspec (`msp430ware_3_80_14_01`) — the GUI/mpack transport and the HAL are inherited from it; the sun-sensor application and the SPI slave are not.
 
 All code lives in [MOVE-IIIa-SunSensor/](MOVE-IIIa-SunSensor/) (renamed from the original spaces-in-name CCS project).
 
@@ -25,7 +30,7 @@ Replace `Debug` with `Release` for the optimized build. Output is `MOVE-IIIa-Sun
 
 Inside the IDE, the active target/connection comes from [MOVE-IIIa-SunSensor/targetConfigs/MSP430i2041.ccxml](MOVE-IIIa-SunSensor/targetConfigs/MSP430i2041.ccxml) and the debug launch configs from [.theia/launch.json](.theia/launch.json) (TI MSP430 USB1 debug probe).
 
-There is no test framework — this is bare-metal MCU firmware. Verification is done on hardware via the GUI.
+There is no test framework — this is bare-metal MCU firmware. Verification is done on hardware (an SPI master, or the `USE_UART_OUTPUT` build + the Python tools in [tools/](tools/)).
 
 ### Compile-time flags / preprocessor
 
@@ -33,7 +38,8 @@ Set in `.cproject` and reflected in the makefiles:
 
 - `__MSP430i2041__`, `__ENABLE_GUI__`
 - `--use_hw_mpy=16`, `--opt_for_speed=5`, `--printf_support=minimal`
-- Heap = 80, Stack = 80 bytes (very small — be deliberate about allocations)
+- Heap = 80, Stack = 256 bytes (small — be deliberate about allocations; stack was raised from 80 to cover the `sqrtf` in the sun-vector math)
+- Output path is chosen in [Include/Config_Common.h](MOVE-IIIa-SunSensor/Include/Config_Common.h): `USE_SPI_OUTPUT` (default) vs `USE_UART_OUTPUT`, mutually exclusive (`#error` enforced)
 
 ### clangd
 
@@ -43,14 +49,18 @@ Set in `.cproject` and reflected in the makefiles:
 
 Three cooperating layers — keep changes within the layer that owns the concern:
 
-### 1. Application — [Source/main.c](MOVE-IIIa-SunSensor/Source/main.c), [Source/callbacks_mpack.c](MOVE-IIIa-SunSensor/Source/callbacks_mpack.c)
+### 1. Application — [Source/main.c](MOVE-IIIa-SunSensor/Source/main.c)
 
-`main()` runs a foreground state machine driven by a single `volatile uint8_t command` byte. The protocol is:
+The production data path:
 
-- **ADC → GUI**: SD24 ISR (`SD24_ISR` in `main.c`) latches `SD24MEM0`/`SD24MEM1` into globals and sets `adcReady`. The main loop's `else` branch sends both via `GUIComm_sendInt16("0"/"1", ...)`.
-- **GUI → MCU**: incoming mpack messages match against the `GUI_RXCommands[]` table (single-char string keys `"3"`..`"6"`), each entry firing a `GUICallback_*` in `callbacks_mpack.c`. Callbacks **never apply hardware changes directly** — they stop the ADC, stash the new value in a global, and set `command` to a `ADC_*` constant from [Include/callbacks_mpack.h](MOVE-IIIa-SunSensor/Include/callbacks_mpack.h). The main loop's `if/else if` ladder is what actually writes `SD24INCTLx`/`SD24PREx` and re-arms the ADC. Preserve that ISR-defers-to-main-loop split when adding commands.
+- **SD24 ISR** (`SD24IV_SD24MEM3` case): accumulates all four quadrant channels and, every `ADC_AVG_N` (32) raw 4 kHz samples, block-averages them, advances `sample_count` by 32, and sets `adcReady` — a **125 Hz** averaged frame rate. Keep the ISR short: averaging only, no float/CRC.
+- **Main loop**: wakes on `adcReady` (LPM0 between frames), takes a GIE-guarded atomic snapshot of the four averaged ADCs + `sample_count`, refreshes the I²C temperature ~1 Hz, runs `compute_sun_vector()` (closed-form, one `sqrtf`, no per-frame trig), then publishes:
+  - **SPI build:** `spi_publish_frame()` packs the 27-byte frame + CRC into a free **triple-buffer** slot and publishes by index; the `USCI_A0` SPI ISR serves `READ_FRAME`/`READ_ID`/`READ_STATUS`/`NOP` (always-RX, deterministic 2-byte lead). See [SUN_SENSOR_SPI_PROTOCOL.md](SUN_SENSOR_SPI_PROTOCOL.md).
+  - **UART build:** emits the same values as one plain-text line for the Python tools.
 
-Adding a new GUI→MCU command means: (a) `#define` an `ADC_*`/command ID in `callbacks_mpack.h`, (b) add a callback in `callbacks_mpack.c`, (c) register it in `GUI_RXCommands[]` in `main.c`, (d) add a branch in the main-loop ladder.
+The watchdog is **held** through init and only started (`WDT_RUN`) once the main loop is about to pet it; all I²C waits are bounded so a stuck bus can't hang boot.
+
+**Legacy GUI-command path (UART build only):** the original TI demo's `GUI_RXCommands[]` table + `GUICallback_*` in [Source/callbacks_mpack.c](MOVE-IIIa-SunSensor/Source/callbacks_mpack.c) (set PGA gain / channel preload via mpack from a GUI Composer GUI) is retained but is **not** part of the SPI production path. Those callbacks defer hardware writes to the main loop via a `command` byte + `ADC_*` constants (from [Include/callbacks_mpack.h](MOVE-IIIa-SunSensor/Include/callbacks_mpack.h)) — preserve that ISR-defers-to-main-loop split if you extend it.
 
 ### 2. GUI transport — [Source/GUIComm_mpack.c](MOVE-IIIa-SunSensor/Source/GUIComm_mpack.c), [Source/MSP430_GUI/GUI_mpack.c](MOVE-IIIa-SunSensor/Source/MSP430_GUI/GUI_mpack.c), [Source/MSP430_GUI/mpack/](MOVE-IIIa-SunSensor/Source/MSP430_GUI/mpack/)
 

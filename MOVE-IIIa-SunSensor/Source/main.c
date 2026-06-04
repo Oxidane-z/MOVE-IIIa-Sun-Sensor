@@ -128,13 +128,17 @@ static const uint8_t id_response[4] = { 'S', 'U', 'N', SPI_PROTOCOL_VERSION };
 static const uint8_t nop_response[1] = { 0x00 };
 static const uint8_t err_response[1] = { SPI_ERR_BYTE };
 
-// Double-buffered FRAME payload: main loop builds into the non-published
-// buffer, then atomically flips `spi_ready_idx` to publish.  SPI ISR snapshots
-// `spi_ready_idx` at the start of a transaction so the frame seen by the
-// master is always coherent (never mid-build).  The atomicity guard is the
-// volatile single-byte index, not the buffers themselves.
-static uint8_t          spi_tx_buf[2][SPI_FRAME_LEN];
-static volatile uint8_t spi_ready_idx = 0;
+// Triple-buffered FRAME payload.  Three buffers guarantee the master never
+// reads a mid-build or overwritten frame WITHOUT a CS-edge interrupt (eUSCI
+// 4-wire SPI has none): on READ_FRAME the ISR marks the buffer it is streaming
+// (`spi_inflight_idx`), and the publisher always builds into the one buffer
+// that is neither published (`spi_ready_idx`) nor in flight.  So a slow
+// transaction spanning several 8 ms publish cycles can never have its source
+// buffer clobbered -- two buffers could (the publisher laps the reader after
+// two publishes).
+static uint8_t          spi_tx_buf[3][SPI_FRAME_LEN];
+static volatile uint8_t spi_ready_idx = 0;          // latest fully-built frame
+static volatile uint8_t spi_inflight_idx = 0;       // buffer the ISR is streaming
 
 // 2-byte STATUS response, rebuilt on each READ_STATUS transaction.
 static uint8_t spi_status_buf[2];
@@ -239,6 +243,39 @@ static void i2c_init(void)
     UCB0CTLW0 &= ~UCSWRST;                      // release
 }
 
+// Bounded busy-waits for the I2C polling below.  A stuck bus (slave holding
+// SDA/SCL, a dead slave caught mid-byte, an eUSCI in a bad state) must never
+// hang the device.  CRITICAL: the prime read runs during init while the
+// watchdog is still held (WDTHOLD), so an unbounded wait there would be an
+// unrecoverable boot hang.  ~50k iterations is far longer than any real byte at
+// 128 kHz SCL, yet still a fraction of a second worst case.
+#define I2C_WAIT_TIMEOUT  50000u
+
+static uint8_t i2c_wait_ifg(uint16_t mask)      // 1 = flag set, 0 = timed out
+{
+    uint16_t t = I2C_WAIT_TIMEOUT;
+    while (!(UCB0IFG & mask)) {
+        if (--t == 0u) return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t i2c_wait_stop_clear(void)        // 1 = STOP cleared, 0 = timed out
+{
+    uint16_t t = I2C_WAIT_TIMEOUT;
+    while (UCB0CTLW0 & UCTXSTP) {
+        if (--t == 0u) return 0u;
+    }
+    return 1u;
+}
+
+static int16_t i2c_fault(void)                  // recover the peripheral, report invalid
+{
+    UCB0CTLW0 |= UCSWRST;                       // reset the eUSCI_B state machine
+    UCB0CTLW0 &= ~UCSWRST;                      // (configuration registers are retained)
+    return TEMP_C100_INVALID;
+}
+
 // Polled I2C read of the AT30TS74, returned as a signed temperature in units
 // of 0.01 degC (centi-degC).  The chip powers up with its register pointer at
 // 0x00 (temperature) and we never move it, so a pure 2-byte read returns the
@@ -248,30 +285,30 @@ static void i2c_init(void)
 // for any resolution (unused low bits read 0; 9-bit default = 0.5 degC steps).
 // We convert on-chip: centi-degC = raw * 100 / 256, rounded to nearest.
 //
-// Returns TEMP_C100_INVALID (0x8000) if the slave NACKs (sensor missing / wrong
-// address) rather than hanging the main loop.
+// Returns TEMP_C100_INVALID (0x8000) on slave NACK (sensor missing) or on any
+// bus timeout -- every wait is bounded, so this can never hang.
 static int16_t i2c_read_temp(void)
 {
-    while (UCB0CTLW0 & UCTXSTP);                // wait for any prior STOP
+    if (!i2c_wait_stop_clear()) return i2c_fault();   // wait for any prior STOP
     UCB0IFG &= ~UCNACKIFG;
 
     UCB0CTLW0 &= ~UCTR;                         // receiver mode
     UCB0CTLW0 |= UCTXSTT;                       // START + slave address (read)
 
     // First byte (MSB) or NACK on the address phase
-    while (!(UCB0IFG & (UCRXIFG0 | UCNACKIFG)));
+    if (!i2c_wait_ifg(UCRXIFG0 | UCNACKIFG)) return i2c_fault();
     if (UCB0IFG & UCNACKIFG) {
         UCB0CTLW0 |= UCTXSTP;
-        while (UCB0CTLW0 & UCTXSTP);
-        return TEMP_C100_INVALID;              // no slave responding
+        if (!i2c_wait_stop_clear()) return i2c_fault();
+        return TEMP_C100_INVALID;              // no slave responding (clean NACK)
     }
     uint8_t msb = UCB0RXBUF;                    // reading clears UCRXIFG0
 
     // Second byte (LSB); hardware auto-generates STOP after UCB0TBCNT=2 bytes
-    while (!(UCB0IFG & UCRXIFG0));
+    if (!i2c_wait_ifg(UCRXIFG0)) return i2c_fault();
     uint8_t lsb = UCB0RXBUF;
 
-    while (UCB0CTLW0 & UCTXSTP);                // wait auto-STOP to complete
+    if (!i2c_wait_stop_clear()) return i2c_fault();   // wait auto-STOP to complete
 
     int16_t raw = (int16_t)(((uint16_t)msb << 8) | lsb);
     return (int16_t)(((int32_t)raw * 100 + 128) >> 8);   // raw/256 -> 0.01 degC, rounded
@@ -338,16 +375,22 @@ static void spi_init(void)
 }
 
 //*****************************************************************************
-// Build a full FRAME payload (27 bytes including CRC) into the non-published
-// half of the double buffer, then atomically publish by flipping the index.
-// Called from main loop (NOT ISR) so the heavier compute stays out of ISR.
+// Build a full FRAME payload (27 bytes including CRC) into a free triple-buffer
+// slot (neither published nor in flight), then atomically publish by writing
+// the index.  Called from main loop (NOT ISR) so the heavier compute stays out
+// of the ISR.
 //*****************************************************************************
 static void spi_publish_frame(uint32_t sc,
                               int16_t a0, int16_t a1, int16_t a2, int16_t a3,
                               int16_t sx_i, int16_t sy_i, int16_t sz_i,
                               uint32_t sum_u, int16_t tc100, uint8_t flags)
 {
-    uint8_t bi = (uint8_t)(spi_ready_idx ^ 1u);     // build into the OTHER buffer
+    // Pick the one buffer that is neither published nor being streamed.  Safe
+    // without disabling interrupts: spi_ready_idx is only written here (main
+    // context), and the ISR only ever sets spi_inflight_idx = spi_ready_idx,
+    // so the chosen bi (!= spi_ready_idx) can never become the in-flight one.
+    uint8_t bi = 0u;
+    while (bi == spi_ready_idx || bi == spi_inflight_idx) bi++;
     uint8_t *b = spi_tx_buf[bi];
 
     b[ 0] = (uint8_t)(sc >> 24);
@@ -529,6 +572,11 @@ void main(void)
     // UCA0 is shared by both modes -- they cannot coexist at runtime.
 #ifdef USE_SPI_OUTPUT
     spi_init();
+    // Publish a CRC-valid NO_SUN frame now so a master doing READ_FRAME before
+    // the first averaged frame (~8 ms) gets a valid frame, not a zero buffer
+    // with a bad CRC.  Runs before GIE, so there is no ISR race.
+    spi_publish_frame(0u, 0,0,0,0, 0,0,0, 0u, TEMP_C100_INVALID, FLAG_NO_SUN);
+    new_data_pending = 0u;                          // boot frame isn't fresh data
     (void)reset_flags;                              // not exposed over SPI for now
 #else
     GUI_Init();                                                                              // Initialize GUI layer
@@ -846,9 +894,10 @@ __interrupt void USCI_A0_SPI_ISR(void)
             uint8_t len;
             switch (b) {
             case CMD_READ_FRAME:
-                // Snapshot the published buffer; the SD24 main-loop path
-                // rebuilds into the OTHER buffer so it can't corrupt us.
-                p = spi_tx_buf[spi_ready_idx];
+                // Mark the published buffer in-flight so the publisher won't
+                // overwrite it for the whole transaction, then stream it.
+                spi_inflight_idx = spi_ready_idx;
+                p = spi_tx_buf[spi_inflight_idx];
                 len = SPI_FRAME_LEN;
                 new_data_pending = 0u;
                 break;

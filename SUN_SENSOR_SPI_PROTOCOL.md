@@ -112,8 +112,16 @@ To handle this, the master MUST:
    | `READ_STATUS` | Skip leading `0xFF` bytes; the first non-`0xFF` byte is `flags`, the next is `new_data`. (Both bytes are guaranteed < `0xFF` by the firmware — `flags` is at most `0x07`, `new_data` is `0x00` or `0x01`.) |
    | `NOP`         | Skip leading `0xFF` bytes; the first `0x00` is the NOP response. |
 
-3. After the transaction, raise CS. The sensor resets its byte state machine
-   on the rising edge; the next transaction starts fresh.
+3. After the transaction, raise CS. In 4-wire mode CS high only tri-states
+   MISO and hardware-realigns the slave's bit counter — it does **not** reset
+   the software response stream (there is no STE interrupt). That stream is
+   re-armed by the next command opcode in the CMD slot (see item 4).
+
+4. **Send only `0x00` dummy bytes.** The slave reframes its response on *any*
+   received byte in the command range `0xA0..0xAF`, so a dummy in that range is
+   taken as a new command and corrupts the in-flight response. `0x00` is the
+   canonical dummy; never put a byte in `0xA0..0xAF` anywhere except the CMD
+   (first) slot.
 
 ### Why the lead byte exists (and why you still resync)
 
@@ -186,7 +194,7 @@ The `READ_FRAME` response is **27 bytes**:
 | Offset | Field | Size | Description |
 |---|---|---|---|
 | 0 | `flags` | u8 | Same definition as FRAME.flags. |
-| 1 | `new_data` | u8 | `0x01` if a fresh frame has been published since the previous `READ_STATUS` / `READ_FRAME`; `0x00` otherwise. **Reading this command clears the flag.** |
+| 1 | `new_data` | u8 | `0x01` if a fresh frame has been published since the previous `READ_STATUS` / `READ_FRAME`; `0x00` otherwise. **Both `READ_STATUS` and `READ_FRAME` clear this latch.** |
 
 > **STATUS reliability caveat:** `READ_STATUS` has **no CRC**; resync relies on
 > the invariants `flags ≤ 0x07` and `new_data ∈ {0,1}` (see the §7 driver). A
@@ -543,7 +551,9 @@ return.
 
 5. **Always raise CS between transactions.** Even if the master plans to
    issue back-to-back commands, raise CS briefly (≥ 1 µs) between them.
-   This resets the sensor's byte state machine and keeps the bus clean.
+   This gives the bus a clean idle gap. (CS edges only realign the slave's bit
+   counter in hardware; the software response stream is reframed by the command
+   opcode, not by CS — see §3.)
 
 6. **Hold CS low for the whole transaction.** The sensor's eUSCI peripheral
    uses the CS (STE) line for hardware framing; toggling CS mid-transaction
@@ -618,9 +628,10 @@ variable and naive "byte 1 is the response" reads will fail intermittently.
   (every received byte queues the next response byte), which yields the
   deterministic 2-byte lead described in §3. There is no CS GPIO interrupt and
   no DMA.
-- The sensor's internal state machine guarantees that the frame the master
-  reads via `READ_FRAME` is never partially updated mid-transaction
-  (double-buffered with an atomic index flip).
+- The sensor guarantees that the frame the master reads via `READ_FRAME` is
+  never partially updated or overwritten mid-transaction: it uses a **triple
+  buffer** (the publisher writes the one slot that is neither published nor in
+  flight), so even a transaction spanning several 8 ms publish cycles is safe.
 - The sensor never initiates communication. It does not assert any
   external "data ready" or interrupt line. (A DRDY line was considered and
   ruled out — no spare GPIO on this board.)
