@@ -744,17 +744,23 @@ on it — see §13.6), which frees the upper bits.
 | 6 | `ALBEDO_SUSPECT` | reserved — diffuse/large-spot heuristic for Earth-albedo discrimination (future) |
 | 7 | reserved | 0 |
 
-### 13.4 `READ_ID` (v3) — 13 bytes
+### 13.4 `READ_ID` (v3) — 15 bytes
+
+The magic changes from v2's `'S' 'U' 'N'` to the 5-byte **`SUS67`**
+(`0x53 0x55 0x53 0x36 0x37`): a longer, more distinctive prefix (lower
+false-match probability during the resync scan; no collision with `0xFF` idle or
+the `0xA0..0xAF` command range). **The v3 resync scan looks for `SUS67`, not
+`SUN`.**
 
 | Offset | Field | Notes |
 |---|---|---|
-| 0..2 | `'S' 'U' 'N'` | magic (resync scan, as v2) |
-| 3 | `protocol_version` | `0x03` |
-| 4 | `fw_major` | firmware build version |
-| 5 | `fw_minor` | |
-| 6..9 | `serial` u32 BE | per-unit ID (MSP430 TLV die record, or production-assigned) |
-| 10 | `capabilities` u8 | bit0 `WRITE_CONFIG`, bit1 `CAL_RW`, bit2 `TRIGGER_DARK`, … |
-| 11..12 | `CRC16` BE | over bytes 0..10 (`READ_ID` is now CRC-protected) |
+| 0..4 | `'S' 'U' 'S' '6' '7'` | magic (resync scan) |
+| 5 | `protocol_version` | `0x03` |
+| 6 | `fw_major` | firmware build version |
+| 7 | `fw_minor` | |
+| 8..11 | `serial` u32 BE | per-unit ID (MSP430 TLV die record, or production-assigned) |
+| 12 | `capabilities` u8 | bit0 `WRITE_CONFIG`, bit1 `CAL_RW`, bit2 `TRIGGER_DARK`, … |
+| 13..14 | `CRC16` BE | over bytes 0..12 (`READ_ID` is CRC-protected) |
 
 ### 13.5 Command set (v3)
 
@@ -789,7 +795,9 @@ recommended for robustness) as a fallback; v3 simply no longer *requires* it. Th
   (27-byte frame, §3 resync), `0x03` → v3 (32-byte frame, this section).
 - **v2 master ↔ v3 sensor:** the v2 master parses with the v2 layout/CRC range;
   the v3 CRC (different range and position) will not validate at the v2 offset,
-  so the master gets *no frame* rather than wrong data — a safe degradation.
+  so the master gets *no frame* rather than wrong data — a safe degradation. Its
+  `READ_ID` scan for the old `SUN` magic also won't match the v3 `SUS67`, so the
+  version mismatch is caught cleanly at startup rather than misread.
 - **v3 master ↔ v2 sensor:** detected as version `0x02`; the master falls back to
   v2 parsing. A dual-version master is the recommended deployment.
 
