@@ -68,13 +68,15 @@ Serializes app values as MessagePack maps (`{cmd: value}`) over the HAL UART. `G
 
 ### 3. HAL — [Source/MSP430_HAL/](MOVE-IIIa-SunSensor/Source/MSP430_HAL/), [Include/HAL.h](MOVE-IIIa-SunSensor/Include/HAL.h)
 
-The only device-specific layer. Filenames are suffixed `_i20xx` to mark MSP430i20xx-family code. To port to a different MSP430 family, replace the `_i20xx.c` files (and `HAL_Config_Private.h`) — `HAL.h` is the stable contract.
+The *intended* device-specific layer. Filenames are suffixed `_i20xx` to mark MSP430i20xx-family code; `HAL.h` is the stable contract.
+
+**Caveat (current state):** the HAL is **not yet** the only device-specific code. The **I²C temperature driver** (`i2c_init` / `i2c_read_temp` / `i2c_fault`), the **SPI slave** (`spi_init` / `spi_publish_frame` / `USCI_A0_SPI_ISR`), and the **SD24 ISR** all poke eUSCI / SD24 registers directly in [Source/main.c](MOVE-IIIa-SunSensor/Source/main.c) — there are no I²C/SPI files under `MSP430_HAL/`. So porting to a different MSP430 family today means editing `main.c` too, not only the `_i20xx.c` files. Extracting those into `HAL_I2C_i20xx.c` / `HAL_SPI_i20xx.c` is deferred future work (the SPI-ISR ↔ frame-buffer coupling makes a clean HAL boundary non-trivial, and there is no second target yet). What the HAL *does* own today:
 
 - `HAL_System_i20xx.c` — clocks, board init (called from `main`'s `HAL_System_Init()`).
 - `HAL_GUIComm_UART_i20xx.c` — eUSCI_A0 UART at **921600 baud** (configured in [HAL_Config_Private.h](MOVE-IIIa-SunSensor/Source/MSP430_HAL/HAL_Config_Private.h)). Receive byte → `tGUICommRXCharCallback` → feeds the mpack reader.
 - `HAL_IO_i20xx.c` — GPIO (status LED on P1.4).
 
-[Include/Config_Common.h](MOVE-IIIa-SunSensor/Include/Config_Common.h) declares the clock frequencies (CPU/HSBUS = 8 MHz nominal in macros, but actual DCO is 16.384 MHz — see comments in `main.c`).
+[Include/Config_Common.h](MOVE-IIIa-SunSensor/Include/Config_Common.h) declares the clock-frequency macros, now set to the true **16.384 MHz** DCO (calibrated in `low_level_init`). They are **declarative only** — nothing computes delays/baud/timeouts from them (the UART baud uses hard-coded register values), so they exist mainly so any future timing math is correct.
 
 ### Startup
 
