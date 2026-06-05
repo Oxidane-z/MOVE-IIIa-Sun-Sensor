@@ -691,4 +691,120 @@ variable and naive "byte 1 is the response" reads will fail intermittently.
 
 ---
 
+## 13. Protocol v3 (DRAFT — not yet implemented)
+
+> **Status: paper draft for review. NOT implemented; the wire format may still
+> change. v2 (version byte `0x02`) remains the shipping protocol.** v3 bundles
+> the breaking changes deferred from v2 plus the additions agreed during review,
+> and bumps the `READ_ID` version byte to `0x03`. Implement only once this layout
+> is frozen.
+
+### 13.1 Rationale
+
+A version bump breaks master compatibility once, so v3 bundles everything that
+needs the break: an expanded health/flags field, per-unit identity, reset
+detection, calibration state + ops, a fusion-quality hint, and an optional
+fixed-offset fast path. Static identity (serial, firmware version) lives in
+`READ_ID`, **not** the per-frame payload, to avoid spending bus bytes every frame.
+
+### 13.2 FRAME layout (v3) — 32 bytes
+
+Bytes 0..24 are **unchanged from v2** (only `flags` gains bit definitions); the
+frame is extended by 5 bytes and the CRC moves to the end.
+
+| Offset | Field | Size | Notes |
+|---|---|---|---|
+| 0..3 | `sample_count` | u32 BE | unchanged (epoch = `(count − 16) × 250 µs`) |
+| 4..9 | `sx,sy,sz` | i16 BE ×3 | unit vector ×10000 (unchanged) |
+| 10..17 | `A0..A3` | i16 BE ×4 | raw quadrant ADCs (unchanged) |
+| 18..21 | `sum` | u32 BE | dark-corrected sum (unchanged) |
+| 22..23 | `temp_c100` | i16 BE | external AT30TS74, centi-°C (unchanged) |
+| 24 | `flags` | u8 | health/quality bits — see §13.3 |
+| **25** | `reset_count` | u8 | **NEW** — increments each boot; the master detects a sensor reset when this changes (more robust than the `sample_count`-jump heuristic) |
+| **26** | `quality` | u8 | **NEW** — 0..255 measurement confidence (fusion weight; 0 = unusable) |
+| **27..28** | `cal_id` | u16 BE | **NEW** — loaded calibration version/CRC (`0x0000` = uncalibrated / linear baseline) |
+| **29** | `reserved` | u8 | **NEW** — 0 (future) |
+| **30..31** | `CRC16` | u16 BE | CRC-16/CCITT-FALSE over bytes **0..29** |
+
+The master clocks `32 + 1 + OVERCLOCK` bytes for `READ_FRAME`.
+
+### 13.3 `flags` bit definitions (v3)
+
+The v2 `flags ≤ 0x07` invariant is **dropped** in v3 (resync no longer depends
+on it — see §13.6), which frees the upper bits.
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | `NO_SUN` | no sun; vector zeroed (as v2) |
+| 1 | `OFF_FOV` | near/past FOV edge (as v2) |
+| 2 | `SATURATED` | ≥1 channel past 80% FS (as v2) |
+| 3 | `INTERNAL_FAULT` | internal error latched (e.g. SD24 overflow — `sd24_ovf_count`) |
+| 4 | `TEMP_INVALID` | AT30TS74 read failed (mirrors `temp_c100 == 0x8000`) |
+| 5 | `CALIBRATED` | this frame used the per-unit polynomial (else linear baseline) |
+| 6 | `ALBEDO_SUSPECT` | reserved — diffuse/large-spot heuristic for Earth-albedo discrimination (future) |
+| 7 | reserved | 0 |
+
+### 13.4 `READ_ID` (v3) — 13 bytes
+
+| Offset | Field | Notes |
+|---|---|---|
+| 0..2 | `'S' 'U' 'N'` | magic (resync scan, as v2) |
+| 3 | `protocol_version` | `0x03` |
+| 4 | `fw_major` | firmware build version |
+| 5 | `fw_minor` | |
+| 6..9 | `serial` u32 BE | per-unit ID (MSP430 TLV die record, or production-assigned) |
+| 10 | `capabilities` u8 | bit0 `WRITE_CONFIG`, bit1 `CAL_RW`, bit2 `TRIGGER_DARK`, … |
+| 11..12 | `CRC16` BE | over bytes 0..10 (`READ_ID` is now CRC-protected) |
+
+### 13.5 Command set (v3)
+
+Existing commands keep their opcodes (`READ_ID 0xA0`, `READ_STATUS 0xA1`,
+`READ_FRAME 0xA2`, `NOP 0xAF`); response lengths follow the v3 layouts. New
+write/config family:
+
+| CMD | Name | Direction | Purpose |
+|---|---|---|---|
+| `0xA3` | `WRITE_CONFIG` | master→sensor | set runtime thresholds (`SUN_PRESENT` / `OFF_FOV` / `SAT`) |
+| `0xA4` | `TRIGGER_DARK` | master→sensor | capture `dark_off[4]` now (sensor must be dark, e.g. eclipse) |
+| `0xA5` | `WRITE_CALIB` | master→sensor | upload calibration coefficients to info-flash (chunked) |
+| `0xA6` | `READ_CALIB` | sensor→master | read back stored `cal_id` + coefficients (QA / verification) |
+
+Write framing (sketch): `CMD | len | payload… | CRC16`. The always-RX ISR
+captures the bytes, verifies CRC, and **defers the action to the main loop**
+(flash writes and threshold changes never happen in the ISR). Completion/result
+is reported via `READ_STATUS`. `READ_STATUS` (v3) is therefore extended to
+`[flags, new_data, reset_count, write_result]` (4 bytes; `write_result` 0 = idle/ok).
+
+### 13.6 Fixed-offset fast path
+
+v3 keeps the deterministic 2-byte wire lead. Because the lead is fixed, a v3
+master **MAY** read at the fixed offset and verify the single CRC instead of
+sliding a window. The overclock + sliding-window resync from §3 stays valid (and
+recommended for robustness) as a fallback; v3 simply no longer *requires* it. The
+`0xA0..0xAF` restriction on dummy bytes still applies (opcodes still reframe).
+
+### 13.7 Compatibility / version negotiation
+
+- A master reads `READ_ID` first and branches on the version byte: `0x02` → v2
+  (27-byte frame, §3 resync), `0x03` → v3 (32-byte frame, this section).
+- **v2 master ↔ v3 sensor:** the v2 master parses with the v2 layout/CRC range;
+  the v3 CRC (different range and position) will not validate at the v2 offset,
+  so the master gets *no frame* rather than wrong data — a safe degradation.
+- **v3 master ↔ v2 sensor:** detected as version `0x02`; the master falls back to
+  v2 parsing. A dual-version master is the recommended deployment.
+
+### 13.8 Open questions to resolve before freezing
+
+- **`WRITE_CALIB` is the hard part:** chunking, info-flash write atomicity (the
+  i2041 has 4 × 256 B info segments), partial-write safety, and the ack/retry
+  protocol all need detailed design. Compile-time bake (already wired via
+  `sun_calib.h`, see firmware) covers the ground path; `WRITE_CALIB` is only for
+  in-orbit / production-line loading without a debugger.
+- `serial` source: MSP430 TLV die record (free, unique) vs production-assigned.
+- `cal_id` definition: CRC of the coefficient blob vs a monotonic version number.
+- `quality` metric: the exact formula from `sum`/SNR, `SATURATED`, `OFF_FOV`.
+- Confirm 8-bit `flags` suffices, or widen to a 16-bit health word.
+
+---
+
 *End of specification. Questions about the sensor side go to {sensor team}.*
