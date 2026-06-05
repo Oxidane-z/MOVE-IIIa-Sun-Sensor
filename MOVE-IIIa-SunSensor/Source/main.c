@@ -164,11 +164,13 @@ static          uint8_t  spi_response_len;
 static const uint8_t    *spi_response_ptr;
 static volatile uint8_t  new_data_pending;          // 1 = fresh frame ready
 
-// Bring-up aid: a non-zero .data global so the CCS Expressions view can confirm
-// the new binary is actually on the chip (Build does NOT auto-flash -- you must
-// Run -> Load -> Load Program).  Reads 0x4D when this 4-wire build is loaded;
-// reads 0x00 if the chip is still running an older binary.  Safe to delete.
-volatile uint8_t spi_build_sentinel = 0x4Du;
+// Bring-up aid: a .data global the CCS Expressions view reads back to confirm
+// the binary on the chip is the one you just built (Build does NOT auto-flash --
+// Run -> Load -> Load Program).  DISCIPLINE: bump this value every time you flash
+// a build you intend to test, then confirm the debugger reads the NEW value --
+// that proves the running binary == your latest source (a stale build keeps the
+// old value).  Current: 0xA5 (= decimal 165).  Safe to delete.
+volatile uint8_t spi_build_sentinel = 0xA5u;
 #endif  // USE_SPI_OUTPUT
 
 //! \brief RX Command structure.
