@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Firmware for a **4-quadrant pinhole sun sensor** on a TI **MSP430i2041**, built in **Code Composer Studio Theia** (CCS v70.5.0). The SD24 sigma-delta ADC reads four photodiode quadrants (TIAs on A0..A3); the firmware block-averages them, computes the **sun unit-vector on-chip** (trig-free closed form), reads an external **AT30TS74** I²C temperature sensor, and serves the result to a host.
+Firmware for a **4-quadrant pinhole sun sensor** on a TI **MSP430i2041**, built in **Code Composer Studio Theia** (CCS v20.5.0). The SD24 sigma-delta ADC reads four photodiode quadrants (TIAs on A0..A3); the firmware block-averages them, computes the **sun unit-vector on-chip** (trig-free closed form), reads an external **AT30TS74** I²C temperature sensor, and serves the result to a host.
 
 Two mutually-exclusive output paths (compile-time, in [Include/Config_Common.h](MOVE-IIIa-SunSensor/Include/Config_Common.h)):
 
