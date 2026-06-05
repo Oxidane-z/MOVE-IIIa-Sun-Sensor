@@ -96,6 +96,14 @@
 #include <GUIComm.h>
 #include <QmathLib.h>
 #include <callbacks_mpack.h>
+#include "sun_calib.h"            // per-unit calibration (identity placeholder until a real cal is dropped in)
+
+// Output frame cadence: 4 kHz raw SD24 / ADC_AVG_N(=32) = 125 Hz.  The
+// temperature-refresh decimation is derived from it so it tracks the frame
+// rate rather than a bare "125" magic number in the main loop.
+#define FRAME_RATE_HZ      (125u)
+#define TEMP_REFRESH_HZ    (1u)
+#define TEMP_DECIM_COUNT   (FRAME_RATE_HZ / TEMP_REFRESH_HZ)
 
 // # defines for application code
 #define STR_LEN_ONE      1
@@ -395,7 +403,7 @@ static void spi_publish_frame(uint32_t sc,
     // context), and the ISR only ever sets spi_inflight_idx = spi_ready_idx,
     // so the chosen bi (!= spi_ready_idx) can never become the in-flight one.
     uint8_t bi = 0u;
-    while (bi == spi_ready_idx || bi == spi_inflight_idx) bi++;
+    while (bi == spi_ready_idx || bi == spi_inflight_idx) bi = (uint8_t)((bi + 1u) % 3u);
     uint8_t *b = spi_tx_buf[bi];
 
     b[ 0] = (uint8_t)(sc >> 24);
@@ -508,21 +516,28 @@ static uint8_t compute_sun_vector(int16_t a0, int16_t a1, int16_t a2, int16_t a3
         flags |= FLAG_OFF_FOV;
     }
 
-    // Sun vector from the centroid.  With tan(alpha)=u and tan(beta)=v, the
-    // identities sin(atan u)=u/sqrt(1+u^2) and cos(atan u)=1/sqrt(1+u^2) let
-    // the original sin/cos products collapse to a closed form needing ONE
-    // sqrt and no transcendental trig:
-    //     sx = sin(a)cos(b) = u / sqrt((1+u^2)(1+v^2))
-    //     sy = cos(a)sin(b) = v / sqrt((1+u^2)(1+v^2))
-    //     sz = cos(a)cos(b) = 1 / sqrt((1+u^2)(1+v^2))
-    // This is exact (not an approximation) and ~10x faster.  The previous
-    // 6 software-float trig calls (2x atan2f + 2x sinf + 2x cosf) cost ~12 ms
-    // per frame on this FPU-less MCU, throttling the 125 Hz frame stream down
-    // to ~79 Hz of actually-sent frames.  We only emit the vector (not the
-    // angles), so atan2 is never needed.
-    float u = x_c * K_GEOM;
-    float v = y_c * K_GEOM;
-    float inv_denom = 1.0f / sqrtf((1.0f + u * u) * (1.0f + v * v));
+    // Sun vector from the centroid, gnomonic (pinhole) convention: the centroid
+    // maps to (u, v) = (s_x/s_z, s_y/s_z), so the unit sun direction is just the
+    // normalized (u, v, 1):
+    //     s = (u, v, 1) / sqrt(1 + u^2 + v^2)
+    // This is a TRUE unit vector (|s| = 1 exactly), one sqrt, no transcendental
+    // trig (mandatory on this FPU-less MCU).  The earlier 6 software-float trig
+    // calls (2x atan2f + 2x sinf + 2x cosf) cost ~12 ms/frame and throttled the
+    // 125 Hz stream to ~79 Hz; we only emit the vector, so atan2 is never needed.
+    // (The previous denominator sqrt((1+u^2)(1+v^2)) gave the right *direction*
+    //  but a sub-unit magnitude -- up to 13% short at the cube-corner working
+    //  point -- which biased masters that treat the vector as already-unit.)
+    //
+    // u,v come from the per-unit calibration polynomial when one is present
+    // (SUN_CALIB_PRESENT), else the linear pinhole baseline (see sun_calib.h).
+    float u, v;
+#if SUN_CALIB_PRESENT
+    sun_apply_calib(x_c, y_c, &u, &v);
+#else
+    u = x_c * K_GEOM;
+    v = y_c * K_GEOM;
+#endif
+    float inv_denom = 1.0f / sqrtf(1.0f + u * u + v * v);
     *sx = u * inv_denom;
     *sy = v * inv_denom;
     *sz = inv_denom;
@@ -563,7 +578,7 @@ void main(void)
     // Configure SD24 ADC channels (quadrant photodiode: 4 TIAs on A0..A3).
     // i2041 SD24 has only 4 channels; internal Ts would require sacrificing
     // one channel (via SD24INCH MUX) -- not done here.  Temperature should
-    // come from the external I2C sensor instead (TBD which chip).
+    // come from the external AT30TS74 over I2C.
     SD24INCTL0 |= SD24GAIN_1;                       // PGA gain for all four channels
     SD24INCTL1 |= SD24GAIN_1;
     SD24INCTL2 |= SD24GAIN_1;
@@ -601,7 +616,7 @@ void main(void)
 #ifdef USE_UART_OUTPUT
     // Header — A0..A3 raw signed 16-bit ADC counts, sx/sy/sz unit-vector x10000,
     // sum is the dark-offset-corrected total (use to detect spot clipping past
-    // linear FOV), temp_c100 is the on-chip temperature in 0.01 degC
+    // linear FOV), temp_c100 is the external AT30TS74 board temperature (converted on-MCU) in 0.01 degC
     // (host: T_C = temp_c100 / 100; 0x8000 = sensor invalid), flags: 1=no_sun,
     // 2=off_fov, 4=saturated.
     uart_send_str("# timestamp A0 A1 A2 A3 sx_x10000 sy_x10000 sz_x10000 sum temp_c100 flags\r\n");
@@ -751,7 +766,7 @@ void main(void)
             // Refresh temperature about once a second (125 Hz output rate).
             // I2C read is blocking ~200 us; doesn't disturb the main cadence.
             static uint8_t temp_decim = 0;
-            if (++temp_decim >= 125) {
+            if (++temp_decim >= TEMP_DECIM_COUNT) {
                 ext_temp_c100 = i2c_read_temp();
                 temp_decim = 0;
             }

@@ -5,8 +5,18 @@
 **Role:** SPI **slave**
 
 **Changes in v2:** the FRAME temperature field (bytes 22..23) now carries the
-on-chip computed temperature in centi-°C (0.01 °C steps), replacing v1's raw
-AT30TS74 register. Masters must update their temperature parse (see §5, §12).
+external AT30TS74 temperature converted on-MCU to centi-°C (0.01 °C steps),
+replacing v1's raw AT30TS74 register. Masters must update their temperature
+parse (see §5, §12).
+
+**Conformance fix (v2.1):** the firmware now emits a **true unit** sun-vector
+(gnomonic normalization). Earlier builds returned the correct *direction* but a
+sub-unit *magnitude* (up to ~13% short near the FOV corners — the cube-corner
+working point). Wire format and version byte (`0x02`) are unchanged — §5 always
+specified a unit-vector, so this only makes the implementation conform. Masters
+that renormalized are unaffected; masters that fed the raw vector into
+QUEST/TRIAD/EKF should drop the now-unnecessary renormalization and will see the
+bias removed.
 
 This document fully specifies the wire protocol between the host MCU (master)
 and the sun sensor (slave). It is self-contained — implementing a master-side
@@ -486,6 +496,8 @@ void adcs_step(void) {
     float sy = f.sy / 10000.0f;
     float sz = f.sz / 10000.0f;
 
+    /* (sx,sy,sz) is already a unit vector (gnomonic-normalized on the sensor);
+       no renormalization needed -- only i16 x10000 quantization remains. */
     feed_attitude_filter(sx, sy, sz, delta_sec);
 }
 ```
@@ -662,9 +674,10 @@ variable and naive "byte 1 is the response" reads will fail intermittently.
   emitting).
 
 - **Sun vector components** are scaled by 10000, so `sx = +9876` means
-  `sx_actual = +0.9876`. Magnitude is not strictly unity by construction
-  (the closed-form formula produces values where `sx² + sy² + sz² ≤ 1` in
-  general); if you need a strictly unit vector, normalize after parsing.
+  `sx_actual = +0.9876`. The firmware emits a **true unit vector**
+  (`sx² + sy² + sz² = 1`, gnomonic normalization); the only deviation is the
+  i16 ×10000 quantization (≤ 1×10⁻⁴ per component), so the host does **not**
+  need to renormalize.
 
 - **`temp_c100` is centi-°C.** `T_celsius = temp_c100 / 100.0` (e.g. `+2375`
   → `+23.75 °C`). The value `0x8000` (`-32768` = `-327.68`) is a sentinel

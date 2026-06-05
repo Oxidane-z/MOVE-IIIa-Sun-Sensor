@@ -225,6 +225,7 @@ def export_c(path, degree, exps, cu, cv):
 #define SUN_CALIB_H
 #include <stdint.h>
 
+#define SUN_CALIB_PRESENT 1
 #define SUN_CALIB_DEG     {degree}
 #define SUN_CALIB_NTERMS  {n}
 

@@ -48,7 +48,7 @@ transport / HAL).
 ## SPI protocol (v2)
 
 The master polls the sensor; each `READ_FRAME` returns a 27-byte frame (sun
-unit-vector, raw quadrant ADCs, dark-corrected sum, on-chip temperature in
+unit-vector, raw quadrant ADCs, dark-corrected sum, external AT30TS74 board temperature in
 centi-°C, status flags, CRC-16/CCITT-FALSE). The full spec, a reference master
 driver, and the master-side reliability requirements are in
 [SUN_SENSOR_SPI_PROTOCOL.md](SUN_SENSOR_SPI_PROTOCOL.md).
