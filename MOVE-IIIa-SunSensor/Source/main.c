@@ -169,8 +169,8 @@ static volatile uint8_t  new_data_pending;          // 1 = fresh frame ready
 // Run -> Load -> Load Program).  DISCIPLINE: bump this value every time you flash
 // a build you intend to test, then confirm the debugger reads the NEW value --
 // that proves the running binary == your latest source (a stale build keeps the
-// old value).  Current: 0xA5 (= decimal 165).  Safe to delete.
-volatile uint8_t spi_build_sentinel = 0xA5u;
+// old value).  Current: 0xA6 (= decimal 166).  Safe to delete.
+volatile uint8_t spi_build_sentinel = 0xA6u;
 #endif  // USE_SPI_OUTPUT
 
 //! \brief RX Command structure.
@@ -890,11 +890,16 @@ void __attribute__ ((interrupt(SD24_VECTOR))) SD24_ISR (void)
 // realigns the bit counter on every CS edge, so a glitched transaction self-
 // heals on the next command.
 //
-// Lead byte is a DETERMINISTIC 2: byte 0 (CMD slot) and byte 1 read back the
-// preloaded 0xFF (the decode ISR physically cannot update TXSHIFT before
-// byte 1 -- RXIFG for the CMD and byte 1's TXSHIFT load happen on the same
-// edge), and response[0] appears at byte 2.  The protocol's overclock (K=4)
-// leaves TXBUF = 0xFF at rest so the next transaction's byte 0 reads 0xFF too.
+// Lead byte is a DETERMINISTIC 2: byte 0 (CMD slot) and byte 1 both read back
+// the idle 0xFF, and response[0] appears at byte 2.  This is enforced by NOT
+// queuing response[0] on the command interrupt (see the command branch): the
+// eUSCI reloads TXSHIFT at the byte boundary before the long command-decode
+// path can write TXBUF, so a response byte queued there has its MSB corrupted
+// (byte1 = 0x80 | (response[0] & 0x7F)).  We therefore keep byte 1 an idle 0xFF
+// (immune to that corruption) and queue response[0] on the first dummy (short
+// path), which lands in time so byte 2 is clean.  The protocol's overclock
+// (K=4) leaves TXBUF = 0xFF at rest so the next transaction's byte 0 reads
+// 0xFF too.
 //*****************************************************************************
 #ifdef USE_SPI_OUTPUT
 
@@ -947,8 +952,23 @@ __interrupt void USCI_A0_SPI_ISR(void)
             }
             spi_response_ptr = p;
             spi_response_len = len;
-            UCA0TXBUF = p[0];
-            spi_state = 1u;                          // next dummy queues response[1]
+            // Do NOT queue response[0] here.  Writing the first response byte on
+            // the command interrupt corrupts it: the eUSCI reloads TXSHIFT from
+            // TXBUF at the byte0->byte1 boundary, but this command-decode path is
+            // long enough that the write lands AFTER byte 1's MSB has already been
+            // clocked out from the stale idle byte.  The hardware then patches only
+            // the low 7 bits, so the master receives byte1 = 0x80 | (response[0] &
+            // 0x7F).  Bench symptom: every FRAME's sample_count high byte came back
+            // 0x80 instead of 0x00 and failed CRC at all offsets -- clock-
+            // independent, because the MSB is committed at the byte boundary
+            // regardless of SCK (lowering the master clock does not help).
+            //
+            // Instead keep wire byte 1 = idle 0xFF (its mangled form 0x80|0x7F is
+            // still 0xFF, so it is immune) and let the SHORT dummy path below queue
+            // response[0]; that write lands in time, so wire byte 2 is clean.  This
+            // is what yields the genuinely clean deterministic 2-byte lead.
+            UCA0TXBUF = SPI_IDLE_BYTE;
+            spi_state = 0u;                          // first dummy queues response[0]
         } else {
             // Dummy byte -> advance the response, or idle once exhausted.
             // Each write has a full byte-time before the hardware loads it.

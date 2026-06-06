@@ -137,15 +137,23 @@ To handle this, the master MUST:
 
 The slave is an MSP430i2041 running at 16.384 MHz with no DMA. Its SPI ISR is
 **always-RX**: every received byte (the CMD plus each dummy) fires `UCRXIFG`,
-and the handler queues the *next* response byte into `UCA0TXBUF`, which the
+and the handler queues the *next* outgoing byte into `UCA0TXBUF`, which the
 hardware loads at the following byte boundary. This gives every byte a full
 byte-time of load margin, so the response stream after the lead is always
 clean.
 
-A lead byte is unavoidable because the CMD-decode and byte 1's `TXSHIFT` load
-happen on the same clock edge — the decode cannot reach `TXSHIFT` in time for
-byte 1. The current firmware therefore emits a **deterministic 2-byte lead**:
-bytes 0 and 1 read back the preloaded `0xFF`, and `response[0]` lands at byte 2.
+The 2-byte lead is structural, and the firmware produces it deliberately. The
+first byte the slave can influence after a command is wire byte 1, whose MSB is
+committed at the byte0→byte1 boundary — the same edge on which the command's
+`UCRXIFG` fires. The command-decode path cannot write `UCA0TXBUF` before that
+MSB is clocked out, so a *response* byte queued on the command interrupt ships
+with a stale MSB (`byte1 = 0x80 | (response[0] & 0x7F)`) — clock-independent,
+and it fails the FRAME CRC on every frame. The firmware therefore queues an
+idle `0xFF` on the command byte (whose mangled form `0x80 | 0x7F` is still
+`0xFF`, so byte 1 is a clean lead regardless) and defers `response[0]` to the
+first *dummy* byte, whose short ISR path writes `UCA0TXBUF` with a full
+byte-time to spare. So bytes 0 and 1 both read back `0xFF` and `response[0]`
+lands cleanly at byte 2: a **deterministic 2-byte lead**.
 
 **The master must still resync anyway — do not hard-code offset 2.** The
 protocol's contract is the defensive `1..3` envelope above, and the
@@ -640,7 +648,7 @@ variable and naive "byte 1 is the response" reads will fail intermittently.
   recover a physically stuck SDA/SCL bus — temperature then stays invalid.
 - SPI slave: eUSCI_A0 in **4-pin hardware-framed** mode (UCMODE_2, STE
   active-low on the CS pin), SPI Mode 0, MSB-first. The ISR is **always-RX**
-  (every received byte queues the next response byte), which yields the
+  (every received byte queues the next outgoing byte), which yields the
   deterministic 2-byte lead described in §3. There is no CS GPIO interrupt and
   no DMA.
 - The sensor guarantees that the frame the master reads via `READ_FRAME` is
