@@ -126,8 +126,10 @@ static   int16_t  ext_temp_c100;                 // Latest AT30TS74 reading in 0
 #define CMD_READ_ID       (0xA0u)   // -> 4 bytes : 'S' 'U' 'N' version
 #define CMD_READ_STATUS   (0xA1u)   // -> 2 bytes : flags, new_data
 #define CMD_READ_FRAME    (0xA2u)   // -> 27 bytes : full atomic frame + CRC16
+#define CMD_READ_HW_ID    (0xA7u)   // -> 8 bytes : MCU TLV die-record identity
 #define CMD_NOP           (0xAFu)   // -> 1 byte  : 0x00 (sanity ping)
 
+#define SPI_HW_ID_LEN     (8u)      // READ_HW_ID response length
 #define SPI_FRAME_LEN     (27u)     // FRAME response length
 #define SPI_IDLE_BYTE     (0xFFu)   // pre-loaded TX when no transaction is active
 #define SPI_ERR_BYTE      (0xFFu)   // returned for unknown commands
@@ -136,6 +138,13 @@ static   int16_t  ext_temp_c100;                 // Latest AT30TS74 reading in 0
 static const uint8_t id_response[4] = { 'S', 'U', 'N', SPI_PROTOCOL_VERSION };
 static const uint8_t nop_response[1] = { 0x00 };
 static const uint8_t err_response[1] = { SPI_ERR_BYTE };
+
+// READ_HW_ID response: the MSP430i2041 factory TLV die record (lot/wafer ID +
+// die X/Y position), filled once at init.  An opaque, unique-per-die identity
+// the master uses to tell SUS units apart and to detect a shared/miswired CS
+// (all slots returning the same id == physically one sensor).  Additive to v2:
+// the READ_ID version byte stays 0x02, so existing masters are unaffected.
+static uint8_t hw_id_response[SPI_HW_ID_LEN];
 
 // Triple-buffered FRAME payload.  Three buffers guarantee the master never
 // reads a mid-build or overwritten frame WITHOUT a CS-edge interrupt (eUSCI
@@ -169,8 +178,8 @@ static volatile uint8_t  new_data_pending;          // 1 = fresh frame ready
 // Run -> Load -> Load Program).  DISCIPLINE: bump this value every time you flash
 // a build you intend to test, then confirm the debugger reads the NEW value --
 // that proves the running binary == your latest source (a stale build keeps the
-// old value).  Current: 0xA6 (= decimal 166).  Safe to delete.
-volatile uint8_t spi_build_sentinel = 0xA6u;
+// old value).  Current: 0xA8 (= decimal 168).  Safe to delete.
+volatile uint8_t spi_build_sentinel = 0xA8u;
 #endif  // USE_SPI_OUTPUT
 
 //! \brief RX Command structure.
@@ -351,6 +360,33 @@ static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len)
 }
 
 //*****************************************************************************
+// Load the MCU hardware-tied identity into the READ_HW_ID response buffer.
+//
+// The MSP430i2041 exposes a factory TLV die record; we copy the 8 most
+// identifying bytes:
+//   TLV_LOT_WAFER_ID : 4 bytes
+//   TLV_DIE_X_POS    : 2 bytes
+//   TLV_DIE_Y_POS    : 2 bytes
+// Together these identify the physical die uniquely enough for the master to
+// distinguish multiple SUS units without burning a production serial number.
+// Called once from spi_init() before SPI RX interrupts are enabled, so the
+// buffer is fully populated before any transaction can stream it.
+//*****************************************************************************
+static void spi_load_hw_id_response(void)
+{
+    const uint8_t *tlv = (const uint8_t *)TLV_START;
+
+    hw_id_response[0] = tlv[TLV_LOT_WAFER_ID + 0u];
+    hw_id_response[1] = tlv[TLV_LOT_WAFER_ID + 1u];
+    hw_id_response[2] = tlv[TLV_LOT_WAFER_ID + 2u];
+    hw_id_response[3] = tlv[TLV_LOT_WAFER_ID + 3u];
+    hw_id_response[4] = tlv[TLV_DIE_X_POS + 0u];
+    hw_id_response[5] = tlv[TLV_DIE_X_POS + 1u];
+    hw_id_response[6] = tlv[TLV_DIE_Y_POS + 0u];
+    hw_id_response[7] = tlv[TLV_DIE_Y_POS + 1u];
+}
+
+//*****************************************************************************
 // SPI slave init: UCA0 as 4-pin hardware-framed SPI slave (UCMODE_2, STE
 // active-low on P1.0).  The eUSCI peripheral handles chip-select framing in
 // hardware: while STE (CS) is low the slave shifts; when CS goes high MISO is
@@ -366,6 +402,8 @@ static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len)
 //*****************************************************************************
 static void spi_init(void)
 {
+    spi_load_hw_id_response();
+
     // 4-pin SPI: P1.0 = UCA0STE (CS in), P1.1 = UCA0CLK (in),
     // P1.2 = UCA0SOMI (out), P1.3 = UCA0SIMO (in).
     P1SEL0 |=  (BIT0 | BIT1 | BIT2 | BIT3);
@@ -940,6 +978,10 @@ __interrupt void USCI_A0_SPI_ISR(void)
             case CMD_READ_ID:
                 p = id_response;
                 len = sizeof(id_response);
+                break;
+            case CMD_READ_HW_ID:
+                p = hw_id_response;
+                len = sizeof(hw_id_response);
                 break;
             case CMD_NOP:
                 p = nop_response;

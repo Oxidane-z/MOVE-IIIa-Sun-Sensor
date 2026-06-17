@@ -119,6 +119,7 @@ To handle this, the master MUST:
    |---------------|---------------------------------------------------------|
    | `READ_FRAME`  | Slide a 27-byte CRC-16 window over offsets `0..K`; accept the first offset whose CRC validates. |
    | `READ_ID`     | Scan for the magic prefix `'S' 'U' 'N'` and accept the version byte after it. |
+   | `READ_HW_ID`  | Current firmware: read the 8 hardware-ID bytes at `r[1]` after discarding the CMD-slot MISO byte. |
    | `READ_STATUS` | Skip leading `0xFF` bytes; the first non-`0xFF` byte is `flags`, the next is `new_data`. (Both bytes are guaranteed < `0xFF` by the firmware — `flags` is at most `0x07`, `new_data` is `0x00` or `0x01`.) |
    | `NOP`         | Skip leading `0xFF` bytes; the first `0x00` is the NOP response. |
 
@@ -172,10 +173,17 @@ never use DMA on this MCU) while still guaranteeing reliable data.
 | `0xA0` | `READ_ID` | 4 | **9** = 1 CMD + 4 response + 4 overclock | Returns magic identifier `'S' 'U' 'N' 0x02`. Use for sensor presence detection and protocol-version check. |
 | `0xA1` | `READ_STATUS` | 2 | **7** = 1 + 2 + 4 | Returns `[flags, new_data]`. Cheap — useful for polling whether a new frame is available without reading the whole FRAME. |
 | `0xA2` | `READ_FRAME` | 27 | **32** = 1 + 27 + 4 | Returns the full atomic sensor frame (see §5). This is the primary command. |
+| `0xA7` | `READ_HW_ID` | 8 | **13** = 1 CMD + 8 response + 4 overclock | Returns the 8-byte MCU hardware ID. Use to distinguish multiple SUS units. |
 | `0xAF` | `NOP` | 1 | **6** = 1 + 1 + 4 | Returns `0x00`. Sanity ping. |
 | any other | — | 1 | — | Returns `0xFF` (error indicator). **Weak NAK:** this is the same value as the idle/lead byte, so the master cannot positively distinguish "illegal command" from "no / garbled response". Don't use it for error signalling — rely on `READ_ID` and the FRAME CRC instead. |
 
 All multi-byte values in responses are **big-endian** unless noted otherwise.
+
+`READ_HW_ID` returns an opaque hardware ID copied from the MSP430i2041 factory
+TLV die record: 4 bytes of `TLV_LOT_WAFER_ID`, 2 bytes of
+`TLV_DIE_X_POS`, and 2 bytes of `TLV_DIE_Y_POS`. Masters should compare or log
+the 8-byte sequence as a hardware-tied identifier; they do not need to interpret
+the subfields.
 
 The lead bytes are **absorbed by the overclock window**, not added to it — the
 N-byte response shifts right by 1..3 within the `(response + overclock)`
@@ -232,6 +240,12 @@ The `READ_FRAME` response is **27 bytes**:
 | 1 | `'U'` (0x55) | |
 | 2 | `'N'` (0x4E) | |
 | 3 | `0x02` | SPI_PROTOCOL_VERSION (this document is v2). Increment on breaking changes. |
+
+### `HW_ID` Layout (`READ_HW_ID` response, 8 bytes)
+
+| Offset | Value | Description |
+|---|---|---|
+| 0..7 | `hardware_id` | Opaque MSP430i2041 TLV die-record bytes for per-unit identification. |
 
 ---
 
@@ -314,9 +328,11 @@ extern uint8_t sun_spi_xfer(uint8_t tx);  /* clock one byte; return MISO byte */
 #define SUN_CMD_READ_ID      0xA0u
 #define SUN_CMD_READ_STATUS  0xA1u
 #define SUN_CMD_READ_FRAME   0xA2u
+#define SUN_CMD_READ_HW_ID   0xA7u
 #define SUN_CMD_NOP          0xAFu
 
 #define SUN_FRAME_LEN        27u
+#define SUN_HW_ID_LEN        8u
 #define SUN_OVERCLOCK        4u    /* extra dummy bytes for slave-lag resync */
 #define SUN_PROTOCOL_VERSION 0x02u
 
@@ -368,6 +384,19 @@ bool sun_sensor_read_id(uint8_t *version_out) {
         }
     }
     return false;
+}
+
+/* ===== READ_HW_ID: read the 8-byte hardware ID ===== */
+bool sun_sensor_read_hw_id(uint8_t hw_id_out[SUN_HW_ID_LEN]) {
+    uint8_t r[SUN_HW_ID_LEN + SUN_OVERCLOCK];
+    sun_cs_low();
+    (void)sun_spi_xfer(SUN_CMD_READ_HW_ID);
+    for (uint8_t i = 0; i < sizeof(r); i++)
+        r[i] = sun_spi_xfer(0x00);
+    sun_cs_high();
+
+    if (hw_id_out) memcpy(hw_id_out, &r[1], SUN_HW_ID_LEN);
+    return true;
 }
 
 /* ===== READ_STATUS: skip 0xFF leads, then 2 data bytes =====
@@ -607,15 +636,16 @@ variable and naive "byte 1 is the response" reads will fail intermittently.
 2. **`READ_ID`**: scan the overclocked response for the `'S' 'U' 'N'` magic
    and verify the trailing version byte is `0x02`. If no match found,
    debug electrical / mode / clock before proceeding.
-3. **`NOP`**: skip leading 0xFF bytes; the first non-0xFF byte should be
+3. **`READ_HW_ID`**: read and log the 8-byte hardware ID.
+4. **`NOP`**: skip leading 0xFF bytes; the first non-0xFF byte should be
    `0x00`.
-4. **`READ_FRAME` with sensor covered (dark)**: slide the CRC window — some
+5. **`READ_FRAME` with sensor covered (dark)**: slide the CRC window — some
    offset within `0..OVERCLOCK` should validate. `sx, sy, sz ≈ 0`,
    `flags == 0x01` (NO_SUN).
-5. **`READ_FRAME` under bright direct light** (phone flashlight is fine):
+6. **`READ_FRAME` under bright direct light** (phone flashlight is fine):
    CRC matches; some of `A0..A3` are large positive; `sx, sy, sz` are
    non-zero; `flags == 0x00` or possibly `0x04` (SATURATED).
-6. **Lead-byte stability check** (optional): the §7 `sun_sensor_read_frame`
+7. **Lead-byte stability check** (optional): the §7 `sun_sensor_read_frame`
    recovers the frame at an index `off` in its receive buffer `r[]`. Log that
    `off` over 100 consecutive calls. Note `off` is **one less than the
    on-the-wire lead count**, because the driver discards the CMD-slot MISO byte
@@ -626,9 +656,9 @@ variable and naive "byte 1 is the response" reads will fail intermittently.
      (1–2 wire lead bytes).
    If `off` ever exceeds 2 (or no offset validates within the window), the wire
    lead has broken the ≤3 envelope — your clock is too fast; lower it.
-7. **`sample_count` advances** between successive frames at the expected
+8. **`sample_count` advances** between successive frames at the expected
    rate (~32 units per 8 ms), as long as you poll faster than 125 Hz.
-8. **Move the light source** and observe `sx, sy` swinging through their
+9. **Move the light source** and observe `sx, sy` swinging through their
    range while `sz` stays near `+10000` for near-axis light and decreases
    for off-axis light.
 
